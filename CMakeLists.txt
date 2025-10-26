@@ -4,7 +4,9 @@ project(brcm-emmc VERSION 1.5.0)
 include(cmake/verstring.cmake)
 get_verstring(VERSTRING)
 
-add_subdirectory(mailbox.resource EXCLUDE_FROM_ALL)
+if(NOT TARGET mailbox)
+    add_subdirectory(mailbox.resource EXCLUDE_FROM_ALL)
+endif()
 
 add_executable(brcm-emmc.device
     src/main.c
