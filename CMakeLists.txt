@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.14.0)
+project(brcm-emmc VERSION 1.5.0)
+
+include(cmake/verstring.cmake)
+get_verstring(VERSTRING)
+
+add_executable(brcm-emmc.device
+    src/main.c
+    src/init.c
+    src/abortio.c
+    src/beginio.c
+    src/close.c
+    src/expunge.c
+    src/extfunc.c
+    src/open.c
+    src/findtoken.c
+    src/mbox.c
+    src/emmc.c
+    src/unittask.c
+)
+
+target_compile_options(brcm-emmc.device PRIVATE -Os -m68040 -msmall-code -mregparm=4 -fomit-frame-pointer)
+target_compile_definitions(brcm-emmc.device PRIVATE VERSION_STRING="${VERSTRING}")
+target_include_directories(brcm-emmc.device PRIVATE include)
+target_link_options(brcm-emmc.device PRIVATE -ffreestanding -nostdlib -nostartfiles -s -Wl,-e_rom_start -Wl,-T${CMAKE_CURRENT_SOURCE_DIR}/ldscript.lds)
+target_link_libraries(brcm-emmc.device devicetree)
+
+set_target_properties(brcm-emmc.device PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ldscript.lds)
