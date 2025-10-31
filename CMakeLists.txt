@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.14.0)
 project(brcm-emmc VERSION 1.5.0)
 
+include(cmake/bin2h.cmake)
 include(cmake/verstring.cmake)
 get_verstring(VERSTRING)
 
@@ -22,6 +23,8 @@ add_executable(brcm-emmc.device
     src/emmc.c
     src/unittask.c
 )
+
+bin_to_header(brcm-emmc.device)
 
 target_compile_options(brcm-emmc.device PRIVATE -Os -m68040 -msmall-code -mregparm=4 -fomit-frame-pointer)
 target_compile_definitions(brcm-emmc.device PRIVATE VERSION_STRING="${VERSTRING}")
