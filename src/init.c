@@ -14,12 +14,6 @@
 extern const char deviceName[];
 extern const char deviceIdString[];
 
-void kprintf(const char * msg asm("a0"), void * args asm("a1")) 
-{
-    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
-    RawDoFmt(msg, args, (APTR)putch, NULL);
-}
-
 /*
     Some properties, like e.g. #size-cells, are not always available in a key, but in that case the properties
     should be searched for in the parent. The process repeats recursively until either root key is found

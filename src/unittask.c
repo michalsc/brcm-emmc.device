@@ -16,8 +16,8 @@
 
 struct RelocHunk
 {
-	ULONG hunkSize;
-	ULONG *hunkData;
+    ULONG hunkSize;
+    ULONG *hunkData;
 };
 
 struct SmartBuffer
@@ -37,34 +37,39 @@ static int lseg_read_long(struct SmartBuffer *buff, ULONG *ptr)
         return 0;
 }
 
-static ULONG LoadSegBlock(struct SmartBuffer *bu)
+static ULONG LoadSegBlock(struct EMMCBase *EMMCBase, struct SmartBuffer *bu)
 {
     struct ExecBase *SysBase = *(struct ExecBase **)4UL;
-    ULONG data;
-    APTR ret;
-	LONG firstHunk, lastHunk;
+    LONG firstHunk, lastHunk;
     ULONG *words;
-    struct RelocHunk *rh;
     ULONG current_hunk = 0;
 
     if (bu->size < 4 || bu->buffer[0] != HUNK_HEADER) {
 		return 0;
-	}
+    }
 
     /* Parse header */
-    firstHunk = bu->buffer[3];
-    lastHunk = bu->buffer[4];
+    words = &bu->buffer[1];
+    while (*words != 0) {
+        words += *words + 1;
+    }
+    words++; /* Skip the trailing 0 */
+    words++; /* Skip table size */
+    firstHunk = *words++;
+    lastHunk = *words++;
+    ULONG hunks = lastHunk - firstHunk + 1;
 
-    words = &bu->buffer[5];
-
-    rh = AllocMem(sizeof(struct RelocHunk) * (lastHunk - firstHunk + 1), MEMF_PUBLIC);
+    struct RelocHunk *rh = AllocMem(sizeof(struct RelocHunk) * hunks, MEMF_PUBLIC);
+    if (!rh) {
+        return 0;
+    }
 
     /* Pre-allocate memory for all loadable hunks */
-    for (unsigned i = 0; i < lastHunk - firstHunk + 1; i++)
+    for (unsigned i = 0; i < hunks; i++)
     {
         ULONG size = *words++;
         ULONG requirements = MEMF_PUBLIC;
-        if (size & (HUNKF_CHIP | HUNKF_FAST) == (HUNKF_CHIP | HUNKF_FAST))
+        if ((size & (HUNKF_CHIP | HUNKF_FAST)) == (HUNKF_CHIP | HUNKF_FAST))
         {
             requirements = *words++;
         }
@@ -90,22 +95,25 @@ static ULONG LoadSegBlock(struct SmartBuffer *bu)
     /* Load and relocate hunks one after another */
     do
     {
-        ULONG hunk_size;
-        ULONG hunk_type;
+        /* Mask out the hunk type flags */
+        ULONG hunk_type = *words & 0x3fffffffUL;
 
-        switch((hunk_type = *words))
+        bug("[brcm-sdhc] LoadSegBlock hunk type %ld at 0x%lx\n", hunk_type, (ULONG)words);
+        switch(hunk_type)
         {
             case HUNK_CODE: // Fallthrough
             case HUNK_DATA: // Fallthrough
             case HUNK_BSS:
-                hunk_size = words[1];
+            {
+                ULONG hunk_size = words[1];
                 if (current_hunk >= firstHunk) {
                     if (hunk_type != HUNK_BSS) {
-                        CopyMem(&words[2], &rh[current_hunk].hunkData[2], hunk_size * 4);
+                        CopyMem(&words[2], &rh[current_hunk - firstHunk].hunkData[2], hunk_size * 4);
                     }
                 }
                 words += 2 + hunk_size;
                 break;
+            }
             
             case HUNK_RELOC32:  // Fallthrough
             case HUNK_RELOC32SHORT:
@@ -167,22 +175,72 @@ static ULONG LoadSegBlock(struct SmartBuffer *bu)
                 words++;
                 break;
 
+            case HUNK_DEBUG:
+                words += words[1] + 2;
+                break;
+
             case HUNK_END:
                 words++;
                 current_hunk++;
                 break;
+
+            default:
+                /* Unknown hunk, prevent infinite loop */
+                bug("[brcm-sdhc] Unknown hunk type: %ld\n", hunk_type);
+                FreeMem(rh, sizeof(struct RelocHunk) * hunks);
+                return 0;
         }
     } while(current_hunk <= lastHunk);
 
-    if (rh) {
-        ret = &rh[0].hunkData[1];
-        FreeMem(rh, sizeof(struct RelocHunk) * (lastHunk - firstHunk + 1));
-    }
-
-    return MKBADDR(ret);   
+    APTR ret = &rh[0].hunkData[1];
+    FreeMem(rh, sizeof(struct RelocHunk) * hunks);
+    return MKBADDR(ret);
 }
 
-static void LoadFilesystem(struct EMMCUnit *unit, ULONG dosType)
+/*
+ * Use PatchFlags to compute the extended size of FileSysEntry.
+ *
+ * FileSysHeaderBlock defines 23 reserved fields for future expansion
+ * in addition to the first 9 matching FileSysEntry.
+ *
+ * In practice, current RDB partitioning tools never set patch flags
+ * beyond the first 9, and many existing autoboot ROMs don't process
+ * them correctly.
+ */
+static struct FileSysEntry* MakeFileSysEntry(struct FileSysHeaderBlock* fhb)
+{
+    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    ULONG fse_ext_fields = 0;
+    ULONG patch_flags = fhb->fhb_PatchFlags;
+
+    /* Never allocate a struct shorter than its NDK definition */
+    const ULONG FSE_FIXED_FIELDS = 9;
+    patch_flags >>= FSE_FIXED_FIELDS;
+
+    /* Count any flags beyond the first 9. These are usually all 0 */
+    while (patch_flags)
+    {
+        fse_ext_fields++;
+        patch_flags >>= 1;
+    }
+
+    const ULONG fse_size = sizeof(struct FileSysEntry) + fse_ext_fields * sizeof(LONG);
+    struct FileSysEntry *fse = AllocMem(fse_size, MEMF_CLEAR);
+    if (!fse)
+        return NULL;
+
+    /* 
+        FileSysEntry consists of:
+        * 3 initial fields (DosType, Version and Patch flags)
+        * 9 fixed fields (fse_Type to fse_GlobalVec)
+        * extra fields determined by patch flags (if any)
+    */
+    ULONG bytes_to_copy = (3 + FSE_FIXED_FIELDS + fse_ext_fields) * sizeof(LONG);
+    CopyMem(&fhb->fhb_DosType, &fse->fse_DosType, bytes_to_copy);
+    return fse;
+}
+
+static struct FileSysEntry * LoadFilesystem(struct EMMCUnit *unit, ULONG dosType, ULONG minVersion)
 {
     struct EMMCBase *EMMCBase = unit->su_Base;
     struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
@@ -255,104 +313,109 @@ static void LoadFilesystem(struct EMMCUnit *unit, ULONG dosType)
 
                     if (buff->fshd.fhb_DosType == dosType)
                     {
-                        APTR buffer = AllocMem(65536, MEMF_PUBLIC);
-                        ULONG buffer_size = 65536;
-                        ULONG loaded = 0;
-
                         if (EMMCBase->emmc_Verbose)
                         {
                             bug("[brcm-emmc:%ld] DOSType match!\n", unit->su_UnitNum);
                         }   
 
-                        // Check LSEG location
-                        ULONG lseg = buff->fshd.fhb_SegListBlocks;
-
-                        union
+                        if (buff->fshd.fhb_Version > minVersion)
                         {
-                            struct RigidDiskBlock       rdsk;
-                            struct PartitionBlock       part;
-                            struct FileSysHeaderBlock   fshd;
-                            struct LoadSegBlock         lseg;
-                            ULONG                       ublock[512/4];
-                            UBYTE                       bblock[512];
-                        } *ls_buff = AllocMem(512, MEMF_PUBLIC);
+                            APTR buffer = AllocMem(65536, MEMF_PUBLIC);
+                            ULONG buffer_size = 65536;
+                            ULONG loaded = 0;
 
-                        while(lseg != 0xffffffff)
-                        {
-                            emmc_read((APTR)ls_buff->bblock, 512, unit->su_StartBlock + lseg, EMMCBase);
-
-                            if (ls_buff->ublock[0] == IDNAME_LOADSEG)
+                            if (EMMCBase->emmc_Verbose)
                             {
-                                ULONG cnt = ls_buff->lseg.lsb_SummedLongs;
-                                ULONG sum = 0;
+                                bug("[brcm-emmc:%ld] Version %ld.%ld higher than minimum %ld.%ld!\n", unit->su_UnitNum, 
+                                    buff->fshd.fhb_Version >> 16, buff->fshd.fhb_Version & 0xffff, 
+                                    minVersion >> 16, minVersion & 0xffff);
+                            }
 
-                                /* Header was found. Checksum the block now */
-                                for (int x = 0; x < cnt; x++) {
-                                    sum += ls_buff->ublock[x];
-                                }
+                            // Check LSEG location
+                            ULONG lseg = buff->fshd.fhb_SegListBlocks;
 
-                                /* If sum == 0 then the block can be considered valid. */
-                                if (sum == 0)
+                            union
+                            {
+                                struct RigidDiskBlock       rdsk;
+                                struct PartitionBlock       part;
+                                struct FileSysHeaderBlock   fshd;
+                                struct LoadSegBlock         lseg;
+                                ULONG                       ublock[512/4];
+                                UBYTE                       bblock[512];
+                            } *ls_buff = AllocMem(512, MEMF_PUBLIC);
+
+                            while(lseg != 0xffffffff)
+                            {
+                                emmc_read((APTR)ls_buff->bblock, 512, unit->su_StartBlock + lseg, EMMCBase);
+
+                                if (ls_buff->ublock[0] == IDNAME_LOADSEG)
                                 {
-                                    lseg = ls_buff->lseg.lsb_Next;
+                                    ULONG cnt = ls_buff->lseg.lsb_SummedLongs;
+                                    ULONG sum = 0;
 
-                                    if (loaded + 4*123 > buffer_size) {
-                                        APTR new_buff = AllocMem(buffer_size + 65536, MEMF_PUBLIC);
-                                        CopyMemQuick(buffer, new_buff, buffer_size);
-                                        FreeMem(buffer, buffer_size);
-                                        buffer = new_buff;
-                                        buffer_size += 65536;
+                                    /* Header was found. Checksum the block now */
+                                    for (int x = 0; x < cnt; x++) {
+                                        sum += ls_buff->ublock[x];
                                     }
 
-                                    CopyMemQuick(ls_buff->lseg.lsb_LoadData, buffer + loaded, 4 * 123);
+                                    /* If sum == 0 then the block can be considered valid. */
+                                    if (sum == 0)
+                                    {
+                                        lseg = ls_buff->lseg.lsb_Next;
 
-                                    loaded += 4*123;
+                                        if (loaded + 4*123 > buffer_size) {
+                                            APTR new_buff = AllocMem(buffer_size + 65536, MEMF_PUBLIC);
+                                            CopyMemQuick(buffer, new_buff, buffer_size);
+                                            FreeMem(buffer, buffer_size);
+                                            buffer = new_buff;
+                                            buffer_size += 65536;
+                                        }
+
+                                        CopyMemQuick(ls_buff->lseg.lsb_LoadData, buffer + loaded, 4 * 123);
+
+                                        loaded += 4*123;
+                                    }
+                                }
+                            }
+
+                            if (EMMCBase->emmc_Verbose)
+                            {
+                                bug("[brcm-emmc:%ld] Loaded %ld bytes into buffer at %08lx\n", unit->su_UnitNum, loaded, (ULONG)buffer);
+                            }
+
+                            struct SmartBuffer bu;
+                            
+                            bu.buffer = buffer;
+                            bu.pos = 0;
+                            bu.size = buffer_size;
+                            
+                            ULONG segList = LoadSegBlock(EMMCBase, &bu);
+
+                            struct FileSysResource *fsr = OpenResource(FSRNAME);
+
+                            if (fsr)
+                            {
+                                struct FileSysEntry *fse = MakeFileSysEntry(&buff->fshd);
+                                
+                                if (fse)
+                                {
+                                    /* Set Node's name to the creator of this entry, set SegList to loaded FS */
+                                    fse->fse_Node.ln_Name = unit->su_Base->emmc_Device.dd_Library.lib_Node.ln_Name;
+                                    fse->fse_SegList = segList;
+
+                                    Forbid();
+                                    AddHead(&fsr->fsr_FileSysEntries, &fse->fse_Node);
+                                    Permit();
+
+                                    /* Release all memory and return FSE */
+                                    FreeMem(buffer, buffer_size);
+                                    FreeMem(ls_buff, 512);
+                                    FreeMem(buff, 512);
+
+                                    return fse;
                                 }
                             }
                         }
-
-                        if (EMMCBase->emmc_Verbose)
-                        {
-                            bug("[brcm-emmc:%ld] Loaded %ld bytes into buffer at %08lx\n", unit->su_UnitNum, loaded, (ULONG)buffer);
-                        }
-
-                        struct SmartBuffer bu;
-                        
-                        bu.buffer = buffer;
-                        bu.pos = 0;
-                        bu.size = buffer_size;
-                        
-                        ULONG segList = LoadSegBlock(&bu);
-
-                        struct FileSysEntry *fse = AllocMem(sizeof(struct FileSysEntry), MEMF_CLEAR);
-
-                        if (fse) {
-                            struct FileSysResource *fsr = OpenResource(FSRNAME);
-                            ULONG *dstPatch = &fse->fse_Type;
-                            ULONG *srcPatch = &buff->fshd.fhb_Type;
-                            ULONG patchFlags = buff->fshd.fhb_PatchFlags;
-                            while (patchFlags) {
-                                // Patch only if this bit is set in PatchFlags
-                                if (patchFlags & 1)
-                                    *dstPatch = *srcPatch;
-                                
-                                dstPatch++;
-                                srcPatch++;
-                                patchFlags >>= 1;
-                            }
-                            fse->fse_DosType = buff->fshd.fhb_DosType;
-                            fse->fse_Version = buff->fshd.fhb_Version;
-                            fse->fse_PatchFlags = buff->fshd.fhb_PatchFlags;
-                            fse->fse_Node.ln_Name = NULL;
-                            fse->fse_SegList = segList;
-
-                            Forbid();
-                            AddHead(&fsr->fsr_FileSysEntries, &fse->fse_Node);
-                            Permit();
-                        }
-
-                        FreeMem(buffer, buffer_size);
-                        FreeMem(ls_buff, 512);
                     }
                 }
             }
@@ -360,9 +423,11 @@ static void LoadFilesystem(struct EMMCUnit *unit, ULONG dosType)
     }
 
     FreeMem(buff, 512);
+    
+    return NULL;
 }
 
-struct FileSysEntry * findFSE(struct EMMCUnit *unit, ULONG dosType)
+struct FileSysEntry * findFSE(struct EMMCUnit *unit, ULONG dosType, ULONG minVersion)
 {
     struct EMMCBase *EMMCBase = unit->su_Base;
     struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
@@ -380,8 +445,10 @@ struct FileSysEntry * findFSE(struct EMMCUnit *unit, ULONG dosType)
         {
             if (n->fse_DosType == dosType)
             {
-                ret = n;
-                break;
+                if (n->fse_Version >= minVersion) {
+                    ret = n;
+                    break;
+                }
             }
         }
         Permit();
@@ -564,11 +631,27 @@ static void MountPartitions(struct EMMCUnit *unit)
                             ULONG *paramPkt = AllocMem(24 * sizeof(ULONG), MEMF_PUBLIC);
                             UBYTE *name = AllocMem(buff.part.pb_DriveName[0] + 1, MEMF_PUBLIC);
                             struct ConfigDev *cdev = EMMCBase->emmc_ConfigDev;
-                            struct FileSysEntry *fse = findFSE(unit, buff.part.pb_Environment[DE_DOSTYPE]);
+                            struct FileSysEntry *fse_found = findFSE(unit, buff.part.pb_Environment[DE_DOSTYPE], 0);
+                            struct FileSysEntry *fse = NULL;
+                            ULONG minVersion = 0;
 
+                            /* 
+                                If FSE was found, find out its version. New FSE will be created
+                                only if it is newer than the existing one.
+                            */
+                            if (fse_found != NULL) {
+                                minVersion = fse_found->fse_Version;
+                            }
+
+                            /* Load filesystem if the one in RDB is more recent, otherwise return the */
+                            fse = LoadFilesystem(unit, buff.part.pb_Environment[DE_DOSTYPE], minVersion);
+                            
+                            /* 
+                                If fse is NULL it means the filesystem was either not found in RDB,
+                                or it was older then the one found in FileSys resource 
+                            */
                             if (fse == NULL) {
-                                LoadFilesystem(unit, buff.part.pb_Environment[DE_DOSTYPE]);
-                                fse = findFSE(unit, buff.part.pb_Environment[DE_DOSTYPE]);
+                                fse = fse_found;
                             }
                             
                             if (EMMCBase->emmc_Verbose)

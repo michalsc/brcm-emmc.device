@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14.0)
-project(brcm-emmc VERSION 1.6.0)
+project(brcm-emmc VERSION 1.7.0)
 
 include(cmake/bin2h.cmake)
 include(cmake/verstring.cmake)
@@ -23,6 +23,7 @@ add_executable(brcm-emmc.device
     src/emmc.c
     src/unittask.c
     src/io.c
+    src/debug.c
 )
 
 set_source_files_properties(src/abortio.c PROPERTIES COMPILE_FLAGS 

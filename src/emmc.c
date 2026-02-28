@@ -65,10 +65,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
     wr32(EMMCBase->emmc_Regs, EMMC_ARG1, arg);
 
 #if 0
-    {
-        ULONG args[] = {cmd, arg};
-        RawDoFmt("[brcm-emmc] sending command %08lx, arg %08lx\n", args, (APTR)putch, NULL);
-    }
+    bug("[brcm-emmc] sending command %08lx, arg %08lx\n", cmd, arg);
 #endif
 
     // Set command reg
@@ -681,7 +678,7 @@ int emmc_microsd_init(struct EMMCBase *EMMCBase)
 	    }
 	    else
 	    {
-            //RawDoFmt("[brcm-emmc] card is busy, retrying\n", NULL, (APTR)putch, NULL);
+            //bug("[brcm-emmc] card is busy, retrying\n");
             delay(500000, EMMCBase);
 	    }       
 	}
@@ -1341,14 +1338,14 @@ static int emmc_do_data_command(int is_write, uint8_t *buf, uint32_t buf_size, u
 
             // Reset the data circuit
             emmc_reset_dat(EMMCBase);
-            //RawDoFmt("SD: error sending CMD%ld, ", &command, (APTR)putch, NULL);
-            //RawDoFmt("error = %08lx.  ", &SDCardBase->sd_LastError, (APTR)putch, NULL);
+            //bug("SD: error sending CMD%ld, ", command);
+            //bug("error = %08lx.  ", SDCardBase->sd_LastError);
             retry_count++;
             /*
             if(retry_count < max_retries)
-                RawDoFmt("Retrying...\n", NULL, (APTR)putch, NULL);
+                bug("Retrying...\n");
             else
-                RawDoFmt("Giving up.\n", NULL, (APTR)putch, NULL);
+                bug("Giving up.\n");
             */
         }
 	}

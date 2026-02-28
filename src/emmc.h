@@ -9,6 +9,7 @@
 #include <exec/interrupts.h>
 #include <devices/timer.h>
 #include <libraries/configvars.h>
+#include <common/compiler.h>
 #include <stdint.h>
 
 #if defined(__INTELLISENSE__)
@@ -84,6 +85,7 @@ struct EMMCBase {
     UBYTE               emmc_ReadOnlyUnit0;
     UBYTE               emmc_Verbose;
     UBYTE               emmc_isMicroSD;
+    UBYTE               emmc_UseRawPutChar;
 
     struct Interrupt    emmc_Interrupt;
 };
@@ -385,12 +387,7 @@ static inline void wr32be(APTR addr, ULONG offset, ULONG val)
 
 /* Misc */
 
-static inline void putch(UBYTE data asm("d0"), APTR ignore asm("a3"))
-{
-    *(UBYTE*)0xdeadbeef = data;
-}
-
-void kprintf(const char * msg asm("a0"), void * args asm("a1"));
+void kprintf(REGARG(const char * msg, "a0"), REGARG(void * args, "a1"), REGARG(struct EMMCBase *EMMCBase, "a3"));
 void delay(ULONG us, struct EMMCBase *EMMCBase);
 ULONG EMMC_Expunge(struct EMMCBase * EMMCBase asm("a6"));
 APTR EMMC_ExtFunc(struct EMMCBase * EMMCBase asm("a6"));
@@ -400,7 +397,7 @@ void EMMC_BeginIO(struct IORequest *io asm("a1"));
 LONG EMMC_AbortIO(struct IORequest *io asm("a1"));
 
 #define bug(string, ...) \
-    do { ULONG args[] = {0, __VA_ARGS__}; kprintf(string, &args[1]); } while(0)
+    do { ULONG args[] = {0, __VA_ARGS__}; kprintf(string, &args[1], EMMCBase); } while(0)
 
 #define TIMEOUT_WAIT(check_func, tout) \
     do { ULONG cnt = (tout) / 2; if (cnt == 0) cnt = 1; while(cnt != 0) { if (check_func) break; \
