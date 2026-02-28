@@ -15,8 +15,6 @@
 #define asm(x) /* x */
 #endif
 
-#define EMMC_VERSION  1
-#define EMMC_REVISION 0
 #define EMMC_PRIORITY 20
 
 #define USE_BUSY_TIMER  1

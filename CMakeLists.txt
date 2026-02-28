@@ -22,12 +22,21 @@ add_executable(brcm-emmc.device
     src/mbox.c
     src/emmc.c
     src/unittask.c
+    src/io.c
 )
+
+set_source_files_properties(src/abortio.c PROPERTIES COMPILE_FLAGS 
+    "-fcall-saved-d1 -fcall-saved-a0 -fcall-saved-a1")
+set_source_files_properties(src/beginio.c PROPERTIES COMPILE_FLAGS 
+    "-fcall-saved-d1 -fcall-saved-a0 -fcall-saved-a1")
 
 bin_to_header(brcm-emmc.device)
 
 target_compile_options(brcm-emmc.device PRIVATE -Os -m68040 -msmall-code -mregparm=4 -fomit-frame-pointer)
-target_compile_definitions(brcm-emmc.device PRIVATE VERSION_STRING="${VERSTRING}")
+target_compile_definitions(brcm-emmc.device PRIVATE 
+    VERSION_STRING="${VERSTRING}"
+    EMMC_VERSION=${CMAKE_PROJECT_VERSION_MAJOR}
+    EMMC_REVISION=${CMAKE_PROJECT_VERSION_MINOR})
 target_include_directories(brcm-emmc.device PRIVATE include)
 target_link_options(brcm-emmc.device PRIVATE -ffreestanding -nostdlib -nostartfiles -s -Wl,-e_rom_start -Wl,-T${CMAKE_CURRENT_SOURCE_DIR}/ldscript.lds)
 target_link_libraries(brcm-emmc.device devicetree)
