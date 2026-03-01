@@ -409,5 +409,6 @@ void emmc_cmd(ULONG command, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase
 int emmc_card_init(struct EMMCBase *EMMCBase);
 int emmc_read(uint8_t *buf, uint32_t buf_size, uint32_t block_no, struct EMMCBase *EMMCBase);
 int emmc_write(uint8_t *buf, uint32_t buf_size, uint32_t block_no, struct EMMCBase *EMMCBase);
+int check_gpt_support(struct EMMCBase *EMMCBase);
 
 #endif /* __EMMC_H */

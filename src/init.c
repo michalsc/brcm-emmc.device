@@ -416,28 +416,35 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
 
                         if (ret > 0)
                         {
-                            for (int i=0; i < 4; i++) {
-                                uint8_t *b = &buff[0x1be + 16 * i];
-                                ULONG p0_Type = b[4];
-                                ULONG p0_Start = b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
-                                ULONG p0_Len = b[12] | (b[13] << 8) | (b[14] << 16) | (b[15] << 24);
+                            if (check_gpt_support(EMMCBase))
+                            {
 
-                                // Partition does exist. List it.
-                                if (p0_Type != 0) {
-                                    if (EMMCBase->emmc_Verbose) {
-                                        bug("[brcm-emmc] Partition%ld: type 0x%02lx, start 0x%08lx, length 0x%08lx\n", i, p0_Type, p0_Start, p0_Len);
-                                    }
+                            }
+                            else
+                            {
+                                for (int i=0; i < 4; i++) {
+                                    uint8_t *b = &buff[0x1be + 16 * i];
+                                    ULONG p0_Type = b[4];
+                                    ULONG p0_Start = b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+                                    ULONG p0_Len = b[12] | (b[13] << 8) | (b[14] << 16) | (b[15] << 24);
 
-                                    // Partition type 0x76 (Amithlon-like) creates new virtual unit with given capacity
-                                    if (p0_Type == 0x76) {
-                                        //emmc_write(0x20000000, 0x20000, p0_Start, EMMCBase);
-                                        struct EMMCUnit *unit = AllocMem(sizeof(struct EMMCUnit), MEMF_PUBLIC | MEMF_CLEAR);
-                                        unit->su_StartBlock = p0_Start;
-                                        unit->su_BlockCount = p0_Len;
-                                        unit->su_Base = EMMCBase;
-                                        unit->su_UnitNum = EMMCBase->emmc_UnitCount;
-                                        
-                                        EMMCBase->emmc_Units[EMMCBase->emmc_UnitCount++] = unit;
+                                    // Partition does exist. List it.
+                                    if (p0_Type != 0) {
+                                        if (EMMCBase->emmc_Verbose) {
+                                            bug("[brcm-emmc] Partition%ld: type 0x%02lx, start 0x%08lx, length 0x%08lx\n", i, p0_Type, p0_Start, p0_Len);
+                                        }
+
+                                        // Partition type 0x76 (Amithlon-like) creates new virtual unit with given capacity
+                                        if (p0_Type == 0x76) {
+                                            //emmc_write(0x20000000, 0x20000, p0_Start, EMMCBase);
+                                            struct EMMCUnit *unit = AllocMem(sizeof(struct EMMCUnit), MEMF_PUBLIC | MEMF_CLEAR);
+                                            unit->su_StartBlock = p0_Start;
+                                            unit->su_BlockCount = p0_Len;
+                                            unit->su_Base = EMMCBase;
+                                            unit->su_UnitNum = EMMCBase->emmc_UnitCount;
+                                            
+                                            EMMCBase->emmc_Units[EMMCBase->emmc_UnitCount++] = unit;
+                                        }
                                     }
                                 }
                             }
