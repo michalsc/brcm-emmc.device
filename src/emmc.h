@@ -28,6 +28,11 @@ struct emmc_scr
     int         emmc_commands;
 };
 
+typedef struct {
+    uint32_t attr;      /* [31:16] length (0=65536), [5:4] act, flags */
+    uint32_t addr;      /* physical buffer address */
+} __attribute__((packed, aligned(4))) ADMA2Desc;
+
 struct EMMCUnit;
 
 struct EMMCBase {
@@ -45,6 +50,7 @@ struct EMMCBase {
 
     struct EMMCUnit *   emmc_Units[5];    /* 5 units at most for the case where SDCard has 4 primary partitions type 0x76 */
     UWORD               emmc_UnitCount;
+    ADMA2Desc *         emmc_ADMA2Table;
 
     struct SignalSemaphore emmc_Lock;
     struct timerequest  emmc_TimeReq;
@@ -86,6 +92,12 @@ struct EMMCBase {
     UBYTE               emmc_Verbose;
     UBYTE               emmc_isMicroSD;
     UBYTE               emmc_UseRawPutChar;
+    UBYTE               emmc_UseInterrupts;
+    UBYTE               emmc_UseDMA;
+    
+    ULONG               emmc_IntNumber;
+    ULONG               emmc_IntType;
+    struct EMMCUnit *   emmc_CurrentUnit;
 
     struct Interrupt    emmc_Interrupt;
 };
@@ -98,6 +110,9 @@ struct EMMCUnit {
     uint8_t             su_UnitNum;
     uint8_t             su_ReadOnly;
     struct Task *       su_Caller;
+    BYTE                su_InterruptSignal;
+    struct timerequest *su_TimeReq;
+    struct MsgPort *    su_TimePort;
 };
 
 void UnitTask();
@@ -129,6 +144,8 @@ void UnitTask();
 #define EMMC_CAPABILITIES_0	0x40
 #define EMMC_CAPABILITIES_1	0x44
 #define EMMC_FORCE_IRPT		0x50
+#define EMMC_ADMA_ERR       0x54
+#define EMMC_ADMA_SA		0x58
 #define EMMC_BOOT_TIMEOUT	0x70
 #define EMMC_DBG_SEL		0x74
 #define EMMC_EXRDFIFO_CFG	0x80
@@ -348,6 +365,13 @@ void UnitTask();
 #define SD_RESET_CMD            (1 << 25)
 #define SD_RESET_DAT            (1 << 26)
 #define SD_RESET_ALL            (1 << 24)
+
+#define ADMA2_VALID         (1 << 0)
+#define ADMA2_END           (1 << 1)
+#define ADMA2_INT           (1 << 2)   /* interrupt after this desc */
+#define ADMA2_ACT_NOP       (0 << 4)
+#define ADMA2_ACT_TRAN      (2 << 4)   /* transfer data */
+#define ADMA2_ACT_LINK      (3 << 4)   /* link to another table */
 
 /* Endian support */
 

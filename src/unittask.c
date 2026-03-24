@@ -98,7 +98,7 @@ static ULONG LoadSegBlock(struct EMMCBase *EMMCBase, struct SmartBuffer *bu)
         /* Mask out the hunk type flags */
         ULONG hunk_type = *words & 0x3fffffffUL;
 
-        bug("[brcm-sdhc] LoadSegBlock hunk type %ld at 0x%lx\n", hunk_type, (ULONG)words);
+        bug("[brcm-emmc] LoadSegBlock hunk type %ld at 0x%lx\n", hunk_type, (ULONG)words);
         switch(hunk_type)
         {
             case HUNK_CODE: // Fallthrough
@@ -186,7 +186,7 @@ static ULONG LoadSegBlock(struct EMMCBase *EMMCBase, struct SmartBuffer *bu)
 
             default:
                 /* Unknown hunk, prevent infinite loop */
-                bug("[brcm-sdhc] Unknown hunk type: %ld\n", hunk_type);
+                bug("[brcm-emmc] Unknown hunk type: %ld\n", hunk_type);
                 FreeMem(rh, sizeof(struct RelocHunk) * hunks);
                 return 0;
         }
@@ -721,6 +721,12 @@ void UnitTask()
     unit = task->tc_UserData;
     EMMCBase = unit->su_Base;
 
+    unit->su_InterruptSignal = AllocSignal(-1);
+
+    unit->su_TimePort = CreateMsgPort();
+    unit->su_TimeReq = CreateIORequest(unit->su_TimePort, sizeof(struct timerequest));
+    OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)unit->su_TimeReq, 0);
+
     NewList(&unit->su_Unit.unit_MsgPort.mp_MsgList);
     unit->su_Unit.unit_MsgPort.mp_SigTask = task;
     unit->su_Unit.unit_MsgPort.mp_SigBit = AllocSignal(-1);
@@ -728,9 +734,11 @@ void UnitTask()
     unit->su_Unit.unit_MsgPort.mp_Node.ln_Type = NT_MSGPORT;
 
     ObtainSemaphore(&EMMCBase->emmc_Lock);
-
+    EMMCBase->emmc_CurrentUnit = unit;
+    
     MountPartitions(unit);
-
+    
+    EMMCBase->emmc_CurrentUnit = NULL;
     ReleaseSemaphore(&EMMCBase->emmc_Lock);
 
     Signal(unit->su_Caller, SIGBREAKF_CTRL_C);

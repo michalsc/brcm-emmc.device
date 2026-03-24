@@ -1,4 +1,6 @@
 #include <exec/types.h>
+#include <exec/execbase.h>
+#include <proto/exec.h>
 #include <stdint.h>
 #include "emmc.h"
 #include "mbox.h"
@@ -30,6 +32,124 @@ void led(int on, struct EMMCBase *EMMCBase)
     }
 }
 
+static inline void cache_clear_line(APTR address) {
+    asm volatile("nop; cpushl dc, (%0)"::"a"(address));
+}
+
+static inline void cache_invalidate_line(APTR address) {
+    asm volatile("cinvl dc, (%0)"::"a"(address));
+}
+
+void cache_clear_range(struct EMMCBase *EMMCBase, APTR address, ULONG length) {
+    APTR base = (APTR)((ULONG)address & ~63);
+    APTR end = (APTR)((ULONG)(address + length + 63) & ~63);
+
+    //bug("cache_clear_range(%08lx, %08lx) expanded to (%08lx, %08lx)\n", address, address + length, base, end);
+    while(base < end) {
+        cache_clear_line(base);
+        base += 64;
+    }
+}
+
+void cache_invalidate_range(APTR address, ULONG length) {
+    APTR base = (APTR)((ULONG)address & ~63);
+    APTR end = (APTR)((ULONG)(address + length + 63) & ~63);
+
+    /* If range shares first cache line with others, clear and invalidate */
+    if (base != address) {
+        cache_clear_line(base);
+        base += 64;
+    }
+
+    /* If range shares last cache line with others, clear and invalidate */
+    if (((ULONG)address + length) & 63 != 0) {
+        cache_clear_line(end - 64);
+        end -= 64;
+    }
+
+    while(base < end) {
+        cache_invalidate_line(base);
+        base += 64;
+    }
+}
+
+int adma2_build_table(ADMA2Desc *descs, uint32_t phys_addr, uint32_t byte_len)
+{
+    int desc_count = 0;
+    
+    while (byte_len > 0) {
+        uint32_t len = byte_len > 65536 ? 65536 : byte_len;
+        /*
+            Length field is bits [31:16].
+            A value of 0 means 65536 — use that for full 64 KiB chunks.
+            Non-zero values 1..65535 are literal.
+        */
+        uint32_t len_field = (len == 65536) ? 0 : len;
+        descs->attr = LE32((len_field << 16)
+                        | ADMA2_ACT_TRAN
+                        | ADMA2_VALID
+                        | ((byte_len == len) ? ADMA2_END : 0));
+        descs->addr = LE32(phys_addr);
+
+        desc_count++;
+        phys_addr += len;
+        byte_len -= len;
+        descs++;
+    }
+    
+    return desc_count;
+}
+
+uint32_t wait_for_interrupt(struct EMMCBase *EMMCBase, uint32_t mask, uint32_t timeout)
+{
+    struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
+    struct EMMCUnit *unit = EMMCBase->emmc_CurrentUnit;
+
+    /* If current unit was not set or interrupts were not enabled by user, go for polling */
+    if (unit == NULL || EMMCBase->emmc_UseInterrupts == 0) {
+        TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & mask), timeout);
+        return rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+    }
+    else {
+        //bug("[brcm-emmc] interrupt based wait_for_interrupt mask %08lx timeout %lu us\n", mask, timeout);
+        //bug("[brcm-emmc] ThisTask=%08lx\n", (ULONG)FindTask(NULL));
+
+        /* Send the timer request for the timeout */
+        unit->su_TimeReq->tr_time.tv_secs = timeout / 1000000;
+        unit->su_TimeReq->tr_time.tv_micro = timeout % 1000000;
+        unit->su_TimeReq->tr_node.io_Command = TR_ADDREQUEST;
+
+        const ULONG sigset = (1 << unit->su_InterruptSignal) | (1 << unit->su_TimePort->mp_SigBit);
+        SetSignal(0, sigset);
+
+        SendIO((struct IORequest *)unit->su_TimeReq);
+
+        /* Unmask interrupts we are waiting for */
+        wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, mask);
+        
+        ULONG recived;
+        if ((recived = Wait(sigset)) & (1 << unit->su_TimePort->mp_SigBit))
+        {
+            WaitIO((struct IORequest *)unit->su_TimeReq);
+            //bug("[brcm-emmc] wait_for_interrupt timeout with status %08lx, signals %08lx\n", rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT), recived);
+
+            wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0);
+            return rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+        }
+        else
+        {
+            AbortIO((struct IORequest *)unit->su_TimeReq);
+            WaitIO((struct IORequest *)unit->su_TimeReq);
+            
+            //bug("[brcm-emmc] wait_for_interrupt completed normally\n");
+
+            return rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+        }
+    }
+
+    
+}
+
 void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
 {
     struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
@@ -57,6 +177,26 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
         }
     }
 
+    /* Is DMA command? Build ADMA2 table in that case */
+    if (cmd & SD_CMD_DMA)
+    {
+        ADMA2Desc *desc = EMMCBase->emmc_ADMA2Table;
+        
+        int desc_count = adma2_build_table(desc, (uint32_t)EMMCBase->emmc_Buffer, EMMCBase->emmc_BlockSize * EMMCBase->emmc_BlocksToTransfer);
+        
+        if (EMMCBase->emmc_Verbose > 1) {
+            bug("[brcm-emmc] ADMA2 Table built with %ld entries:\n", desc_count);
+            for (int i=0; i < desc_count; i++) {
+                bug("[brcm-emmc]   %04ld: attr=%08lx addr=%08lx\n", i, LE32(desc[i].attr), LE32(desc[i].addr));
+            }
+        }
+        //asm volatile("nop; nop; cpushl dc, (%0)"::"a"(desc));
+        //cache_clear_range(EMMCBase, desc, desc_count * sizeof(ADMA2Desc));
+        CacheClearE(desc, desc_count * sizeof(ADMA2Desc), CACRF_ClearD);
+        //asm volatile("nop");
+        wr32(EMMCBase->emmc_Regs, EMMC_ADMA_SA, (uint32_t)desc);
+    }
+
     uint32_t blksizecnt = EMMCBase->emmc_BlockSize | (EMMCBase->emmc_BlocksToTransfer << 16);
 
     wr32(EMMCBase->emmc_Regs, EMMC_BLKSIZECNT, blksizecnt);
@@ -75,8 +215,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
     //SDCardBase->sd_Delay(10, SDCardBase);
 
     // Wait for command complete interrupt
-    TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & 0x8001), timeout);
-    uint32_t irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+    uint32_t irpts = wait_for_interrupt(EMMCBase, 0x8001, timeout);
 
     // Clear command complete status
     wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0001);
@@ -109,81 +248,99 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
             EMMCBase->emmc_Res3 = rd32(EMMCBase->emmc_Regs, EMMC_RESP3);
             break;
     }
-    // If with data, wait for the appropriate interrupt
-    if(cmd & SD_CMD_ISDATA)
+
+    if (cmd & SD_CMD_DMA)
     {
-        uint32_t wr_irpt;
-        int is_write = 0;
-        if(cmd & SD_CMD_DAT_DIR_CH)
-            wr_irpt = (1 << 5);     // read
-        else
+        irpts = wait_for_interrupt(EMMCBase, 0x8002, timeout);
+        //bug("[brcm-emmc] DMA transfer complete, irpt = %08lx\n", irpts);
+        wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
+        
+        if(((irpts & 0xffff0002) != 0x2) && ((irpts & 0xffff0002) != 0x100002))
         {
-            is_write = 1;
-            wr_irpt = (1 << 4);     // write
-        }
-
-        int cur_block = 0;
-        uint32_t *cur_buf_addr = (uint32_t *)EMMCBase->emmc_Buffer;
-        while(cur_block < EMMCBase->emmc_BlocksToTransfer)
-        {
-            tout = timeout / 100;
-            TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & (wr_irpt | 0x8000)), timeout);
-            irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
-            wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0000 | wr_irpt);
-
-            if((irpts & (0xffff0000 | wr_irpt)) != wr_irpt)
-            {
-                bug("[brcm-emmc] Error occured whilst waiting for data ready interrupt (%08lx)\n", irpts);
-
-                EMMCBase->emmc_LastError = irpts & 0xffff0000;
-                EMMCBase->emmc_LastInterrupt = irpts;
-                return;
-            }
-
-            // Transfer the block
-            UWORD cur_byte_no = 0;
-            while(cur_byte_no < EMMCBase->emmc_BlockSize)
-            {
-                if(is_write)
-				{
-					uint32_t data = *(ULONG*)cur_buf_addr;
-                    wr32be(EMMCBase->emmc_Regs, EMMC_DATA, data);
-				}
-                else
-				{
-					uint32_t data = rd32be(EMMCBase->emmc_Regs, EMMC_DATA);
-					*(ULONG*)cur_buf_addr = data;
-				}
-                cur_byte_no += 4;
-                cur_buf_addr++;
-            }
-
-            cur_block++;
+            bug("[brcm-emmc] Error occured whilst waiting for DMA transfer complete interrupt (%08lx)\n", irpts);
+            EMMCBase->emmc_LastError = irpts & 0xffff0000;
+            EMMCBase->emmc_LastInterrupt = irpts;
+            return;
         }
     }
-    // Wait for transfer complete (set if read/write transfer or with busy)
-    if((((cmd & SD_CMD_RSPNS_TYPE_MASK) == SD_CMD_RSPNS_TYPE_48B) ||
-       (cmd & SD_CMD_ISDATA)))
+    else
     {
-        // First check command inhibit (DAT) is not already 0
-        if((rd32(EMMCBase->emmc_Regs, EMMC_STATUS) & 0x2) == 0)
-            wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
-        else
+        // If with data, wait for the appropriate interrupt
+        if(cmd & SD_CMD_ISDATA)
         {
-            TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & 0x8002), timeout);
-            irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
-            wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
-
-            // Handle the case where both data timeout and transfer complete
-            //  are set - transfer complete overrides data timeout: HCSS 2.2.17
-            if(((irpts & 0xffff0002) != 0x2) && ((irpts & 0xffff0002) != 0x100002))
+            uint32_t wr_irpt;
+            int is_write = 0;
+            if(cmd & SD_CMD_DAT_DIR_CH)
+                wr_irpt = (1 << 5);     // read
+            else
             {
-                bug("[brcm-emmc] Error occured whilst waiting for transfer complete interrupt (%08lx)\n", irpts);
-                EMMCBase->emmc_LastError = irpts & 0xffff0000;
-                EMMCBase->emmc_LastInterrupt = irpts;
-                return;
+                is_write = 1;
+                wr_irpt = (1 << 4);     // write
             }
-            wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
+
+            int cur_block = 0;
+            uint32_t *cur_buf_addr = (uint32_t *)EMMCBase->emmc_Buffer;
+            while(cur_block < EMMCBase->emmc_BlocksToTransfer)
+            {
+                tout = timeout / 100;
+                TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & (wr_irpt | 0x8000)), timeout);
+                irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+                wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0000 | wr_irpt);
+
+                if((irpts & (0xffff0000 | wr_irpt)) != wr_irpt)
+                {
+                    bug("[brcm-emmc] Error occured whilst waiting for data ready interrupt (%08lx)\n", irpts);
+
+                    EMMCBase->emmc_LastError = irpts & 0xffff0000;
+                    EMMCBase->emmc_LastInterrupt = irpts;
+                    return;
+                }
+
+                // Transfer the block
+                UWORD cur_byte_no = 0;
+                while(cur_byte_no < EMMCBase->emmc_BlockSize)
+                {
+                    if(is_write)
+                    {
+                        uint32_t data = *(ULONG*)cur_buf_addr;
+                        wr32be(EMMCBase->emmc_Regs, EMMC_DATA, data);
+                    }
+                    else
+                    {
+                        uint32_t data = rd32be(EMMCBase->emmc_Regs, EMMC_DATA);
+                        *(ULONG*)cur_buf_addr = data;
+                    }
+                    cur_byte_no += 4;
+                    cur_buf_addr++;
+                }
+
+                cur_block++;
+            }
+        }
+        // Wait for transfer complete (set if read/write transfer or with busy)
+        if((((cmd & SD_CMD_RSPNS_TYPE_MASK) == SD_CMD_RSPNS_TYPE_48B) ||
+        (cmd & SD_CMD_ISDATA)))
+        {
+            // First check command inhibit (DAT) is not already 0
+            if((rd32(EMMCBase->emmc_Regs, EMMC_STATUS) & 0x2) == 0)
+                wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
+            else
+            {
+                TIMEOUT_WAIT((rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT) & 0x8002), timeout);
+                irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+                wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
+
+                // Handle the case where both data timeout and transfer complete
+                //  are set - transfer complete overrides data timeout: HCSS 2.2.17
+                if(((irpts & 0xffff0002) != 0x2) && ((irpts & 0xffff0002) != 0x100002))
+                {
+                    bug("[brcm-emmc] Error occured whilst waiting for transfer complete interrupt (%08lx)\n", irpts);
+                    EMMCBase->emmc_LastError = irpts & 0xffff0000;
+                    EMMCBase->emmc_LastInterrupt = irpts;
+                    return;
+                }
+                wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffff0002);
+            }
         }
     }
     EMMCBase->emmc_LastCMDSuccess = 1;
@@ -341,6 +498,11 @@ static void emmc_handle_interrupts(struct EMMCBase *EMMCBase)
 
 void emmc_cmd(ULONG command, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase)
 {
+    struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
+    APTR buffer = EMMCBase->emmc_Buffer;
+    BYTE ram_to_device = (command & SD_CMD_DAT_DIR_CH) == 0;
+    ULONG length = EMMCBase->emmc_BlockSize * EMMCBase->emmc_BlocksToTransfer;
+
     // First, handle any pending interrupts
     emmc_handle_interrupts(EMMCBase);
 
@@ -350,6 +512,18 @@ void emmc_cmd(ULONG command, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase
     {
         EMMCBase->emmc_LastCMDSuccess = 0;
         return;
+    }
+
+    if (command & SD_CMD_DMA) {
+        #if 1
+        if (ram_to_device) {
+            cache_clear_range(EMMCBase, buffer, length);
+        } else {
+            cache_invalidate_range(buffer, length);
+        }
+        #else
+        CachePreDMA(buffer, &length, ram_to_device ? DMA_ReadFromRAM : 0);
+        #endif
     }
 
     // Now run the appropriate commands by calling sd_issue_command_int()
@@ -374,8 +548,20 @@ void emmc_cmd(ULONG command, ULONG arg, ULONG timeout, struct EMMCBase *EMMCBase
         EMMCBase->emmc_LastCMD = command;
         cmd_int(command, arg, timeout, EMMCBase);
     }
-}
 
+    if (command & SD_CMD_DMA) {
+        if (!ram_to_device) {
+            cache_invalidate_range(buffer, length);
+        }
+        //asm volatile("cinva ic");
+        #if 0
+        CachePostDMA(buffer, &length, ram_to_device ? DMA_ReadFromRAM : 0);
+        #endif
+
+        //bug("[brcm-emmc] DMA transfer done. ADMA_EA=%08lx STATUS=%08lx\n", rd32(EMMCBase->emmc_Regs, EMMC_ADMA_ERR),
+        //    rd32(EMMCBase->emmc_Regs, EMMC_STATUS));
+    }
+}
 
 // Set the clock dividers to generate a target value
 static uint32_t emmc_get_clock_divider(uint32_t base_clock, uint32_t target_rate)
@@ -553,7 +739,7 @@ int emmc_microsd_init(struct EMMCBase *EMMCBase)
     delay(2000, EMMCBase);
 
     // Mask off sending interrupts to the ARM
-    wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0);
+    wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0); //0xffffffff);
     // Reset interrupts
     wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffffffff);
 
@@ -580,6 +766,15 @@ int emmc_microsd_init(struct EMMCBase *EMMCBase)
     wr32(EMMCBase->emmc_Regs, EMMC_CONTROL0, control0);
     delay(2000, EMMCBase);
 
+    // Enable ADMA2 mode
+    control0 = rd32(EMMCBase->emmc_Regs, EMMC_CONTROL0);
+    control0 &= ~(3 << 3);
+    control0 |= (2 << 3);
+    wr32(EMMCBase->emmc_Regs, EMMC_CONTROL0, control0);
+    
+    bug("[brcm-emmc] ADMA2 mode enabled, control0: %08lx, control1: %08lx\n",
+        rd32(EMMCBase->emmc_Regs, EMMC_CONTROL0),
+        rd32(EMMCBase->emmc_Regs, EMMC_CONTROL1));
 
     // Send CMD0 to the card (reset to idle state)
 	emmc_cmd(GO_IDLE_STATE, 0, 500000, EMMCBase);
@@ -995,7 +1190,7 @@ int emmc_card_init(struct EMMCBase *EMMCBase)
     delay(2000, EMMCBase);
 
     // Mask off sending interrupts to the ARM
-    wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0);
+    wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0); //0xffffffff);
     // Reset interrupts
     wr32(EMMCBase->emmc_Regs, EMMC_INTERRUPT, 0xffffffff);
 
@@ -1021,6 +1216,16 @@ int emmc_card_init(struct EMMCBase *EMMCBase)
     control0 |= 0x00000100;
     wr32(EMMCBase->emmc_Regs, EMMC_CONTROL0, control0);
     delay(2000, EMMCBase);
+
+    // Enable ADMA2 mode
+    control0 = rd32(EMMCBase->emmc_Regs, EMMC_CONTROL0);
+    control0 &= ~(3 << 3);
+    control0 |= (2 << 3);
+    wr32(EMMCBase->emmc_Regs, EMMC_CONTROL0, control0);
+    
+    bug("[brcm-emmc] ADMA2 mode enabled, control0: %08lx, control1: %08lx\n",
+        rd32(EMMCBase->emmc_Regs, EMMC_CONTROL0),
+        rd32(EMMCBase->emmc_Regs, EMMC_CONTROL1));
 
     // Send CMD0 to the card (reset to idle state)
 	emmc_cmd(GO_IDLE_STATE, 0, 500000, EMMCBase);
@@ -1200,13 +1405,13 @@ int ensure_data_mode(struct EMMCBase *EMMCBase)
 {
     struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
 
-	if(EMMCBase->emmc_CardRCA == 0)
-	{
-		// Try again to initialise the card
-		int ret = emmc_card_init(EMMCBase);
-		if(ret != 0)
-			return ret;
-	}
+    if(EMMCBase->emmc_CardRCA == 0)
+    {
+        // Try again to initialise the card
+        int ret = emmc_card_init(EMMCBase);
+        if(ret != 0)
+            return ret;
+    }
 
     emmc_cmd(SEND_STATUS, EMMCBase->emmc_CardRCA << 16, 500000, EMMCBase);
     if(FAIL(EMMCBase))
@@ -1216,101 +1421,112 @@ int ensure_data_mode(struct EMMCBase *EMMCBase)
         return -1;
     }
 
-	uint32_t status = EMMCBase->emmc_Res0;
-	uint32_t cur_state = (status >> 9) & 0xf;
+    uint32_t status = EMMCBase->emmc_Res0;
+    uint32_t cur_state = (status >> 9) & 0xf;
 
-	if(cur_state == 3)
-	{
-		// Currently in the stand-by state - select it
-		emmc_cmd(SELECT_CARD, EMMCBase->emmc_CardRCA << 16, 500000, EMMCBase);
-		if(FAIL(EMMCBase))
-		{
-			bug("[brcm-emmc] ensure_data_mode() no response from CMD7\n");
-			EMMCBase->emmc_CardRCA = 0;
-			return -1;
-		}
-	}
-	else if(cur_state == 5)
-	{
-		// In the data transfer state - cancel the transmission
-		emmc_cmd(STOP_TRANSMISSION, 0, 500000, EMMCBase);
-		if(FAIL(EMMCBase))
-		{
-			bug("[brcm-emmc] ensure_data_mode() no response from CMD12\n");
-			EMMCBase->emmc_CardRCA = 0;
-			return -1;
-		}
+    if(cur_state == 3)
+    {
+        // Currently in the stand-by state - select it
+        emmc_cmd(SELECT_CARD, EMMCBase->emmc_CardRCA << 16, 500000, EMMCBase);
+        if(FAIL(EMMCBase))
+        {
+            bug("[brcm-emmc] ensure_data_mode() no response from CMD7\n");
+            EMMCBase->emmc_CardRCA = 0;
+            return -1;
+        }
+    }
+    else if(cur_state == 5)
+    {
+        // In the data transfer state - cancel the transmission
+        emmc_cmd(STOP_TRANSMISSION, 0, 500000, EMMCBase);
+        if(FAIL(EMMCBase))
+        {
+            bug("[brcm-emmc] ensure_data_mode() no response from CMD12\n");
+            EMMCBase->emmc_CardRCA = 0;
+            return -1;
+        }
 
-		// Reset the data circuit
-		emmc_reset_dat(EMMCBase);
-	}
-	else if(cur_state != 4)
-	{
-		// Not in the transfer state - re-initialise
-		int ret = emmc_card_init(EMMCBase);
-		if(ret != 0)
-			return ret;
-	}
+        // Reset the data circuit
+        emmc_reset_dat(EMMCBase);
+    }
+    else if(cur_state != 4)
+    {
+        // Not in the transfer state - re-initialise
+        int ret = emmc_card_init(EMMCBase);
+        if(ret != 0)
+            return ret;
+    }
 
-	// Check again that we're now in the correct mode
-	if(cur_state != 4)
-	{
-		bug("[brcm-emmc] ensure_data_mode() rechecking status: ");
+    // Check again that we're now in the correct mode
+    if(cur_state != 4)
+    {
+        bug("[brcm-emmc] ensure_data_mode() rechecking status: ");
         emmc_cmd(SEND_STATUS, EMMCBase->emmc_CardRCA << 16, 500000, EMMCBase);
         if(FAIL(EMMCBase))
-		{
-			bug("no response from CMD13\n");
-			EMMCBase->emmc_CardRCA = 0;
-			return -1;
-		}
-		status = EMMCBase->emmc_Res0;
-		cur_state = (status >> 9) & 0xf;
+        {
+            bug("no response from CMD13\n");
+            EMMCBase->emmc_CardRCA = 0;
+            return -1;
+        }
+        status = EMMCBase->emmc_Res0;
+        cur_state = (status >> 9) & 0xf;
 
-		bug("%ld\n", cur_state);
+        bug("%ld\n", cur_state);
 
-		if(cur_state != 4)
-		{
-			bug("[brcm-emmc] unable to initialise SD card to "
-					"data mode (state %ld)\n", cur_state);
-			EMMCBase->emmc_CardRCA = 0;
-			return -1;
-		}
-	}
+        if(cur_state != 4)
+        {
+            bug("[brcm-emmc] unable to initialise SD card to "
+                    "data mode (state %ld)\n", cur_state);
+            EMMCBase->emmc_CardRCA = 0;
+            return -1;
+        }
+    }
 
-	return 0;
+    return 0;
 }
 
 static int emmc_do_data_command(int is_write, uint8_t *buf, uint32_t buf_size, uint32_t block_no, struct EMMCBase *EMMCBase)
 {
     struct ExecBase *SysBase = EMMCBase->emmc_SysBase;
+    BOOL do_dma = (ULONG)buf >= 0x01000000 && (ULONG)buf < 0x80000000;
 
-	// This is as per HCSS 3.7.2.1
-	if(buf_size < EMMCBase->emmc_BlockSize)
-	{
+    // This is as per HCSS 3.7.2.1
+    if(buf_size < EMMCBase->emmc_BlockSize)
+    {
         bug("[brcm-emmc] do_data_command() called with buffer size (%ld) less than "
             "block size (%ld)\n", buf_size, EMMCBase->emmc_BlockSize);
         return -1;
-	}
+    }
 
-	EMMCBase->emmc_BlocksToTransfer = buf_size / EMMCBase->emmc_BlockSize;
-	if(buf_size % EMMCBase->emmc_BlockSize)
-	{
+    EMMCBase->emmc_BlocksToTransfer = buf_size / EMMCBase->emmc_BlockSize;
+    if(buf_size % EMMCBase->emmc_BlockSize)
+    {
         bug("[brcm-emmc] do_data_command() called with buffer size (%ld) not an "
             "exact multiple of block size (%ld)\n", buf_size, EMMCBase->emmc_BlockSize);
         return -1;
-	}
-	EMMCBase->emmc_Buffer = buf;
+    }
+    EMMCBase->emmc_Buffer = buf;
 
-	// Decide on the command to use
-	int command;
-	if(is_write)
-	{
-	    if(EMMCBase->emmc_BlocksToTransfer > 1)
+    /* If DMA was not enabled by user, do not use it */
+    if (EMMCBase->emmc_UseDMA == 0) {
+        do_dma = FALSE;
+    }
+
+    /* Buffer not aligned on 32-bit boundary cannot do dma */
+    if ((ULONG)buf & 0x3) {
+        do_dma = FALSE;
+    }
+
+    // Decide on the command to use
+    int command;
+    if(is_write)
+    {
+        if(EMMCBase->emmc_BlocksToTransfer > 1)
             command = WRITE_MULTIPLE_BLOCK;
         else
             command = WRITE_BLOCK;
-	}
-	else
+    }
+    else
     {
         if(EMMCBase->emmc_BlocksToTransfer > 1)
             command = READ_MULTIPLE_BLOCK;
@@ -1318,10 +1534,14 @@ static int emmc_do_data_command(int is_write, uint8_t *buf, uint32_t buf_size, u
             command = READ_SINGLE_BLOCK;
     }
 
-	int retry_count = 0;
-	int max_retries = 5;
-	while(retry_count < max_retries)
-	{
+    if (do_dma) {
+        command |= SD_CMD_DMA;
+    }
+
+    int retry_count = 0;
+    int max_retries = 5;
+    while(retry_count < max_retries)
+    {
         emmc_cmd(command, block_no, 5000000, EMMCBase);
 
         if(SUCCESS(EMMCBase))
@@ -1348,8 +1568,8 @@ static int emmc_do_data_command(int is_write, uint8_t *buf, uint32_t buf_size, u
                 bug("Giving up.\n");
             */
         }
-	}
-	if(retry_count == max_retries)
+    }
+    if(retry_count == max_retries)
     {
         EMMCBase->emmc_CardRCA = 0;
         return -1;

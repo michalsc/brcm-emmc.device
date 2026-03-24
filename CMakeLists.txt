@@ -9,6 +9,10 @@ if(NOT TARGET mailbox)
     add_subdirectory(mailbox.resource EXCLUDE_FROM_ALL)
 endif()
 
+if(NOT TARGET gic400)
+    add_subdirectory(gic400.library EXCLUDE_FROM_ALL)
+endif()
+
 add_executable(brcm-emmc.device
     src/main.c
     src/init.c
@@ -34,13 +38,13 @@ set_source_files_properties(src/beginio.c PROPERTIES COMPILE_FLAGS
 
 bin_to_header(brcm-emmc.device)
 
-target_compile_options(brcm-emmc.device PRIVATE -Os -m68040 -msmall-code -mregparm=4 -fomit-frame-pointer)
+target_compile_options(brcm-emmc.device PRIVATE -Os -m68040 -mregparm=4 -fomit-frame-pointer)
 target_compile_definitions(brcm-emmc.device PRIVATE 
     VERSION_STRING="${VERSTRING}"
     EMMC_VERSION=${CMAKE_PROJECT_VERSION_MAJOR}
     EMMC_REVISION=${CMAKE_PROJECT_VERSION_MINOR})
 target_include_directories(brcm-emmc.device PRIVATE include)
 target_link_options(brcm-emmc.device PRIVATE -ffreestanding -nostdlib -nostartfiles -s -Wl,-e_rom_start -Wl,-T${CMAKE_CURRENT_SOURCE_DIR}/ldscript.lds)
-target_link_libraries(brcm-emmc.device devicetree)
+target_link_libraries(brcm-emmc.device devicetree gic400)
 
 set_target_properties(brcm-emmc.device PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ldscript.lds)

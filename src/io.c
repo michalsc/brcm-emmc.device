@@ -455,6 +455,7 @@ void int_do_io(struct IORequest *io , struct EMMCBase * EMMCBase)
 
     ObtainSemaphore(&EMMCBase->emmc_Lock);
     led(1, EMMCBase);
+    EMMCBase->emmc_CurrentUnit = unit;
 
     switch (io->io_Command)
     {
@@ -645,6 +646,7 @@ void int_do_io(struct IORequest *io , struct EMMCBase * EMMCBase)
             break;
     }
 
+    EMMCBase->emmc_CurrentUnit = NULL;
     led(0, EMMCBase);
     ReleaseSemaphore(&EMMCBase->emmc_Lock);
 }

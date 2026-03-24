@@ -5,6 +5,7 @@
 #include <proto/exec.h>
 #include <proto/expansion.h>
 #include <proto/devicetree.h>
+#include <proto/gic400.h>
 #include <inline/alib.h>
 
 #include "emmc.h"
@@ -13,6 +14,20 @@
 
 extern const char deviceName[];
 extern const char deviceIdString[];
+
+void EMMC_InterruptHandler(REGARG(struct EMMCBase *EMMCBase, "a1"), REGARG(struct ExecBase *SysBase, "a6"))
+{
+    struct EMMCUnit *unit = EMMCBase->emmc_CurrentUnit;
+    uint32_t irpts = rd32(EMMCBase->emmc_Regs, EMMC_INTERRUPT);
+    //bug("[brcm-emmc] Interrupt received, irpts = %08lx\n", irpts);
+    if (unit != NULL) {
+        EMMCBase->emmc_LastInterrupt = irpts;
+        //bug("[brcm-emmc] Signalling task %08lx with signal %08lx\n", (ULONG)unit->su_Unit.unit_MsgPort.mp_SigTask, 1 << unit->su_InterruptSignal);
+        Signal(unit->su_Unit.unit_MsgPort.mp_SigTask, 1 << unit->su_InterruptSignal);
+    }
+    /* Mask interrupts again */
+    wr32(EMMCBase->emmc_Regs, EMMC_IRPT_EN, 0);
+}
 
 /*
     Some properties, like e.g. #size-cells, are not always available in a key, but in that case the properties
@@ -61,10 +76,12 @@ void delay(ULONG us, struct EMMCBase *EMMCBase)
 
 int strcmp(const char *s1, const char *s2)
 {
-	while (*s1 == *s2++)
-		if (*s1++ == '\0')
-			return (0);
-	return (*(const unsigned char *)s1 - *(const unsigned char *)(s2 - 1));
+    while (*s1 == *s2++) {
+        if (*s1++ == '\0') {
+            return (0);
+        }
+    }
+    return (*(const unsigned char *)s1 - *(const unsigned char *)(s2 - 1));
 }
 
 APTR Init(struct ExecBase *SysBase asm("a6"))
@@ -146,6 +163,9 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
             EMMCBase->emmc_SysBase = SysBase;
             EMMCBase->emmc_DeviceTreeBase = DeviceTreeBase;
 
+            EMMCBase->emmc_ADMA2Table = AllocMem(512 * sizeof(ADMA2Desc) + 64, MEMF_PUBLIC | MEMF_CLEAR);
+            EMMCBase->emmc_ADMA2Table = (ADMA2Desc *)(((ULONG)EMMCBase->emmc_ADMA2Table + 63) & ~63);
+
             InitSemaphore(&EMMCBase->emmc_Lock);
             EMMCBase->emmc_Port.mp_Flags = PA_SIGNAL;
             EMMCBase->emmc_Port.mp_SigBit = SIGBREAKB_CTRL_C;
@@ -157,84 +177,81 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
             SumLibrary((struct Library*)EMMCBase);
 
             bug("[brcm-emmc] DeviceBase at %08lx\n", (ULONG)EMMCBase);
+            bug("[brcm-emmc] AMDMA2 Table at %08lx\n", (ULONG)EMMCBase->emmc_ADMA2Table);
 
-            const char *cmdline = DT_GetPropValue(DT_FindProperty(DT_OpenKey("/chosen"), "bootargs"));
-            const char *cmd;
-
-            EMMCBase->emmc_HideUnit0 = 0;
-            EMMCBase->emmc_ReadOnlyUnit0 = 1;
-
-            if ((cmd = FindToken(cmdline, "emmc.verbose=")))
+            key = DT_OpenKey("/emu68/brcm-emmc");
+            if (!key) {
+                bug("[brcm-emmc] /emu68/brcm-emmc not found\n");
+                disabled = 1;
+            }
+            else
             {
-                ULONG verbose = 0;
-
-                for (int i=0; i < 3; i++)
-                {
-                    if (cmd[13 + i] < '0' || cmd[13 + i] > '9')
-                        break;
-
-                    verbose = verbose * 10 + cmd[13 + i] - '0';
+                if (strcmp(DT_GetPropValue(DT_FindProperty(key, "status")), "disabled") == 0) {
+                    bug("[brcm-emmc] brcm-emmc.device disabled by user\n");
+                    disabled = 1;
                 }
 
-                if (verbose > 10)
+                if (DT_FindProperty(key, "low-speed"))
+                {
+                    bug("[brcm-emmc] Low speed mode forced by user\n");
+                    EMMCBase->emmc_DisableHighSpeed = 1;
+                }
+
+                ULONG verbose = *(ULONG*)DT_GetPropValue(DT_FindProperty(key, "verbose"));
+                if (verbose > 10) {
                     verbose = 10;
-
-                bug("[brcm-emmc] Requested verbosity level: %ld\n", verbose);
-
+                }
                 EMMCBase->emmc_Verbose = (UBYTE)verbose;
-            }
-
-            if ((cmd = FindToken(cmdline, "emmc.unit0=")))
-            {
-                if (cmd[11] == 'r' && cmd[12] == 'o' && (cmd[13] == 0 || cmd[13] == ' ')) {
-                    EMMCBase->emmc_ReadOnlyUnit0 = 1;
-                    EMMCBase->emmc_HideUnit0 = 0;
-                    bug("[brcm-emmc] Unit 0 is read only\n");
+                if (verbose) {
+                    bug("[brcm-emmc] Verbose level set to %ld by user\n", verbose);
                 }
-                else if (cmd[11] == 'r' && cmd[12] == 'w' && (cmd[13] == 0 || cmd[13] == ' ')) {
-                    EMMCBase->emmc_ReadOnlyUnit0 = 0;
-                    EMMCBase->emmc_HideUnit0 = 0;
-                    bug("[brcm-emmc] Unit 0 is writable\n");
-                }
-                else if (cmd[11] == 'o' && cmd[12] == 'f' && cmd[13] == 'f' && (cmd[14] == 0 || cmd[14] == ' ')) {
-                    EMMCBase->emmc_HideUnit0 = 1;
-                    bug("[brcm-emmc] Unit 0 is hidden\n");
-                }
-            }
 
-            if (FindToken(cmdline, "emmc.low_speed"))
-            {
-                bug("[brcm-emmc] 50MHz mode disabled per command line\n");
-
-                EMMCBase->emmc_DisableHighSpeed = 1;
-            }
-
-            if ((cmd = FindToken(cmdline, "emmc.clock=")))
-            {
-                ULONG clock = 0;
-
-                for (int i=0; i < 3; i++)
-                {
-                    if (cmd[11 + i] < '0' || cmd[11 + i] > '9')
+                ULONG unit0 = *(ULONG*)DT_GetPropValue(DT_FindProperty(key, "whole-drive-access"));
+                switch (unit0) {
+                    case 1:
+                        EMMCBase->emmc_ReadOnlyUnit0 = 1;
+                        EMMCBase->emmc_HideUnit0 = 0;
+                        bug("[brcm-emmc] Unit 0 is read only\n");
                         break;
-
-                    clock = clock * 10 + cmd[11 + i] - '0';
+                    case 2:
+                        EMMCBase->emmc_ReadOnlyUnit0 = 0;
+                        EMMCBase->emmc_HideUnit0 = 0;
+                        bug("[brcm-emmc] Unit 0 is writable\n");
+                        break;
+                    case 0:
+                        EMMCBase->emmc_HideUnit0 = 1;
+                        bug("[brcm-emmc] Unit 0 is hidden\n");
+                        break;
+                    default:
+                        bug("[brcm-emmc] Invalid value for whole-drive-access\n");
+                        break;
                 }
 
-                if (clock > 0 && clock < 200)
+                ULONG clock = *(ULONG*)DT_GetPropValue(DT_FindProperty(key, "hs-clock-mhz"));
+                if (clock != 50 && clock > 0 && clock < 200)
                 {
                     bug("[brcm-emmc] Overclocking to %ld MHz requested\n", clock);
                     EMMCBase->emmc_Overclock = 1000000 * clock;
                 }
+
+                if (DT_FindProperty(key, "use-rawputchar"))
+                {
+                    bug("[brcm-emmc] Using RawPutChar for debug output\n");
+                    EMMCBase->emmc_UseRawPutChar = 1;
+                }
+
+                if (DT_FindProperty(key, "use-dma"))
+                {
+                    bug("[brcm-emmc] Using DMA for data transfers\n");
+                    EMMCBase->emmc_UseDMA = 1;
+                }
+                
+                if (DT_FindProperty(key, "use-irq"))
+                {
+                    bug("[brcm-emmc] Using interrupts for data transfers\n");
+                    EMMCBase->emmc_UseInterrupts = 1;
+                }
             }
-
-            if (FindToken(cmdline, "emmc.disable"))
-            {
-                bug("[brcm-emmc] brcm-emmc.device disabled by user\n");
-
-                disabled = 1;
-            }
-
 
             /* Get VC4 physical address of mailbox interface. Subsequently it will be translated to m68k physical address */
             key = DT_OpenKey("/aliases");
@@ -313,6 +330,22 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
 
                             const ULONG *reg = DT_GetPropValue(DT_FindProperty(key, "reg"));
                             EMMCBase->emmc_Regs = (APTR)reg[address_cells - 1];
+                            
+                            /* 
+                                We know emmc has only one GIC interrupt, so extract it without checking
+                                size of interrupt array
+                            */
+                            const ULONG *ints = DT_GetPropValue(DT_FindProperty(key, "interrupts"));
+                            EMMCBase->emmc_IntNumber = ints[1];
+                            EMMCBase->emmc_IntType = ints[2] & 0xf;
+
+                            if (ints[0] == 0) {
+                                bug("[brcm-emmc] Interrupt is SPI with number %ld type %ld\n", EMMCBase->emmc_IntNumber, EMMCBase->emmc_IntType);
+                                EMMCBase->emmc_IntNumber += 32;
+                            } else {
+                                bug("[brcm-emmc] Interrupt is PPI with number %ld type %ld\n", EMMCBase->emmc_IntNumber, EMMCBase->emmc_IntType);
+                                EMMCBase->emmc_IntNumber += 16;
+                            }
                             DT_CloseKey(key);
                         }
                         DT_CloseKey(emmckey);
@@ -364,6 +397,16 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
             if (EMMCBase->emmc_MailBox != NULL && EMMCBase->emmc_Regs != NULL && disabled == 0)
             {
                 AddDevice((struct Device *)EMMCBase);
+
+                struct Library *GIC400_Base = OpenLibrary("gic400.library", 0);
+                if (GIC400_Base) {
+                    EMMCBase->emmc_Interrupt.is_Node.ln_Type = NT_INTERRUPT;
+                    EMMCBase->emmc_Interrupt.is_Node.ln_Name = EMMCBase->emmc_Device.dd_Library.lib_Node.ln_Name;
+                    EMMCBase->emmc_Interrupt.is_Data = EMMCBase;
+                    EMMCBase->emmc_Interrupt.is_Code = (APTR)EMMC_InterruptHandler;
+
+                    AddIntServerEx(EMMCBase->emmc_IntNumber, 0, FALSE, &EMMCBase->emmc_Interrupt);
+                }
 
                 /* Enable eMMC clock */
                 set_clock_state(0x0c, 1, EMMCBase);
