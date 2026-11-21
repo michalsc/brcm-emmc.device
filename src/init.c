@@ -53,6 +53,16 @@ CONST_APTR GetPropValueRecursive(APTR key, CONST_STRPTR property, APTR DeviceTre
     return NULL;
 }
 
+void* memcpy(void *dest, const void *source, long unsigned int size)
+{
+    if (size) {
+        char *dst = dest;
+        const char *src = source;
+        do { *dst++ = *src++; } while(--size);
+    }
+    return dest;
+}
+
 void delay(ULONG us, struct EMMCBase *EMMCBase)
 {
 #if USE_BUSY_TIMER
@@ -165,6 +175,11 @@ APTR Init(struct ExecBase *SysBase asm("a6"))
 
             EMMCBase->emmc_ADMA2Table = AllocMem(512 * sizeof(ADMA2Desc) + 64, MEMF_PUBLIC | MEMF_CLEAR);
             EMMCBase->emmc_ADMA2Table = (ADMA2Desc *)(((ULONG)EMMCBase->emmc_ADMA2Table + 63) & ~63);
+
+            EMMCBase->emmc_BounceBuffer = AllocMem(524288 + 64, MEMF_PUBLIC | MEMF_CLEAR);
+            EMMCBase->emmc_BounceBuffer = (void *)(((ULONG)EMMCBase->emmc_BounceBuffer + 63) & ~63);
+
+            EMMCBase->emmc_NeedEnsure = 1;
 
             InitSemaphore(&EMMCBase->emmc_Lock);
             EMMCBase->emmc_Port.mp_Flags = PA_SIGNAL;

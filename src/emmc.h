@@ -94,6 +94,8 @@ struct EMMCBase {
     UBYTE               emmc_UseRawPutChar;
     UBYTE               emmc_UseInterrupts;
     UBYTE               emmc_UseDMA;
+    UBYTE               emmc_NeedEnsure;
+    void *              emmc_BounceBuffer;
     
     ULONG               emmc_IntNumber;
     ULONG               emmc_IntType;
@@ -373,6 +375,10 @@ void UnitTask();
 #define ADMA2_ACT_TRAN      (2 << 4)   /* transfer data */
 #define ADMA2_ACT_LINK      (3 << 4)   /* link to another table */
 
+#define BOUNCE_BUFFER_SIZE  524288
+
+#define unlikely(x)    __builtin_expect(!!(x), 0)
+
 /* Endian support */
 
 static inline uint64_t LE64(uint64_t x) { return __builtin_bswap64(x); }
@@ -426,6 +432,8 @@ LONG EMMC_AbortIO(struct IORequest *io asm("a1"));
 #define TIMEOUT_WAIT(check_func, tout) \
     do { ULONG cnt = (tout) / 2; if (cnt == 0) cnt = 1; while(cnt != 0) { if (check_func) break; \
     cnt = cnt - 1; delay(2, EMMCBase); }  } while(0)
+
+#define DMAF_NoSync         (1L<<4)
 
 void led(int on, struct EMMCBase *EMMCBase);
 void int_do_io(struct IORequest *io , struct EMMCBase * EMMCBase);
